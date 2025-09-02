@@ -1,27 +1,50 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from src.models.models import ChatRequest, ChatResponse
 from src.services.service import ChatService
 
 app = FastAPI(title="AI Chat System", version="1.0.0")
 
-# Khởi tạo service
-chat_service = ChatService()
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Initialize service
+try:
+    chat_service = ChatService()
+except Exception as e:
+    print(f"Failed to initialize ChatService: {e}")
+    chat_service = None
 
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     """
-    Chat endpoint - xử lý conversation với AI
+    Chat endpoint - handle conversation with AI
 
     Workflow:
-    1. Nhận {message, session_id?}
-    2. Tạo memory từ session_id
-    3. Ghi message vào memory
-    4. Lấy context đã được memory quản lý
-    5. Gọi LLM Venice với context
-    6. Lưu response
-    7. Trả về {session_id, answer}
+    1. Receive {message, session_id?}
+    2. Create memory from session_id
+    3. Add message to memory
+    4. Get context managed by memory
+    5. Call Venice LLM with context
+    6. Save response
+    7. Return {session_id, answer}
     """
+
+    # Check if service is available
+    if not chat_service:
+        raise HTTPException(status_code=503, detail="Chat service is not available")
+
+    # Validate request
+    if not request.message or not request.message.strip():
+        raise HTTPException(status_code=400, detail="Message cannot be empty")
+
     try:
         result = chat_service.process_chat(
             message=request.message, session_id=request.session_id
@@ -33,6 +56,8 @@ async def chat(request: ChatRequest):
             summary=result["summary"],
         )
 
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Chat processing error: {str(e)}")
 
@@ -42,9 +67,18 @@ async def health_check():
     """Health check endpoint"""
     from src.database.redis_client import redis_client
 
-    redis_info = redis_client.get_connection_info()
+    try:
+        redis_info = redis_client.get_connection_info()
+        service_status = "healthy" if chat_service else "unhealthy"
 
-    return {"status": "healthy", "service": "AI Chat System", "redis": redis_info}
+        return {
+            "status": service_status,
+            "service": "AI Chat System",
+            "redis": redis_info,
+            "venice_llm": "available" if chat_service else "unavailable",
+        }
+    except Exception as e:
+        return {"status": "unhealthy", "service": "AI Chat System", "error": str(e)}
 
 
 if __name__ == "__main__":

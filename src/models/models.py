@@ -3,14 +3,14 @@ from typing import Optional
 
 
 class ChatRequest(BaseModel):
-    """Request model cho chat API"""
+    """Request model for chat API"""
 
     message: str
     session_id: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
-    """Response model cho chat API"""
+    """Response model for chat API"""
 
     session_id: str
     answer: str
