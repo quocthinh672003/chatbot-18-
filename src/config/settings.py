@@ -5,7 +5,7 @@ load_dotenv()
 
 # Redis Configuration
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
-REDIS_TTL = int(os.getenv("REDIS_TTL", 86400))  # 24 hours
+REDIS_TTL = int(os.getenv("REDIS_TTL", 604800))  # 7 days
 
 # Venice LLM Configuration
 VENICE_BASE_URL = os.getenv("VENICE_BASE_URL", "https://api.venice.ai")

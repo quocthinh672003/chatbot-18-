@@ -1,6 +1,6 @@
 import uuid
 import requests
-from typing import Optional, List, Dict, Any, Iterator
+from typing import Optional, List, Dict, Any
 from langchain_community.chat_message_histories import RedisChatMessageHistory
 from langchain.memory import ConversationSummaryBufferMemory
 from langchain_core.language_models import BaseLanguageModel
@@ -16,20 +16,20 @@ from src.config.settings import (
     MAX_TOKEN_LIMIT,
     TEMPERATURE,
     MEMORY_K,
+    REDIS_TTL,
 )
 
 
 class VeniceLLM(BaseLanguageModel):
-    """Venice AI API wrapper - compatible with LangChain BaseLanguageModel"""
 
     def __init__(
         self, base_url: str, api_key: str, model: str, temperature: float = 0.5
-    ):
+    ) -> None:
         super().__init__()
-        self.base_url = base_url
-        self.api_key = api_key
-        self.model = model
-        self.temperature = temperature
+        self._base_url = base_url
+        self._api_key = api_key
+        self._model = model
+        self._temperature = temperature
 
         # Validate required fields
         if not api_key:
@@ -103,23 +103,29 @@ class VeniceLLM(BaseLanguageModel):
     def chat(self, messages: List[Dict[str, str]]) -> str:
         """Send chat request to Venice AI"""
         headers = {
-            "Authorization": f"Bearer {self.api_key}",
+            "Authorization": f"Bearer {self._api_key}",
             "Content-Type": "application/json",
         }
 
         payload = {
-            "model": self.model,
+            "model": self._model,
             "messages": messages,
-            "temperature": self.temperature,
+            "temperature": self._temperature,
             "max_tokens": 1000,
         }
 
+        endpoint = f"{self._base_url}/api/v1/chat/completions"
+        
         try:
-            response = requests.post(
-                f"{self.base_url}/v1/chat/completions", headers=headers, json=payload
-            )
-            response.raise_for_status()
+            print(f"Calling Venice AI endpoint: {endpoint}")
+            response = requests.post(endpoint, headers=headers, json=payload, timeout=10)
+            print(f"Response status: {response.status_code}")
+            
+            if response.status_code != 200:
+                raise Exception(f"Venice AI API failed with status {response.status_code}: {response.text}")
+            
             return response.json()["choices"][0]["message"]["content"]
+            
         except requests.exceptions.RequestException as e:
             raise Exception(f"Venice AI API request failed: {str(e)}")
         except KeyError as e:
@@ -129,9 +135,8 @@ class VeniceLLM(BaseLanguageModel):
 
 
 class ChatService:
-    """Chat service using LangChain components - ConversationSummaryBufferMemory"""
 
-    def __init__(self):
+    def __init__(self) -> None:
         try:
             self.llm = VeniceLLM(
                 VENICE_BASE_URL, VENICE_API_KEY, VENICE_MODEL, TEMPERATURE
@@ -143,13 +148,10 @@ class ChatService:
         self, message: str, session_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
-        Process chat request using LangChain components as requested:
-
         1. RedisChatMessageHistory → store history per session (original)
         2. ConversationSummaryBufferMemory → auto summarize + keep recent window
         3. LLM Venice → call with context managed by memory
         """
-
         # Validate input
         if not message or not message.strip():
             raise ValueError("Message cannot be empty")
@@ -159,13 +161,15 @@ class ChatService:
             session_id = str(uuid.uuid4())
 
         try:
+            # Decide TTL: if REDIS_TTL <= 0, do not set TTL (persist forever)
+            ttl_arg: Optional[int] = REDIS_TTL if REDIS_TTL and REDIS_TTL > 0 else None
+
             # RedisChatMessageHistory → store raw messages (not lost when restart app)
             history = RedisChatMessageHistory(
-                session_id=session_id, url=REDIS_URL, ttl=86400
+                session_id=session_id, url=REDIS_URL, ttl=ttl_arg
             )
 
             # ConversationSummaryBufferMemory → automatically decide: keep k recent messages + old summary
-            # This is the core of the original requirement!
             memory = ConversationSummaryBufferMemory(
                 llm=self.llm,  # Use Venice LLM for summarization
                 chat_memory=history,
@@ -178,14 +182,16 @@ class ChatService:
             memory.chat_memory.add_user_message(message)
 
             # Get context managed by memory
-            # If >k messages → prompt sent includes summary of all old + k recent messages
             past_messages = memory.chat_memory.messages
 
-            # Call LLM with context
-            # Venice understands all previous context (via summary),
-            # while having recent details (via k recent messages)
-            messages = past_messages + [{"role": "user", "content": message}]
-            response = self.llm.chat(messages)
+            # Convert BaseMessage objects to dict format for Venice API
+            dict_messages = self._convert_messages_to_dict(past_messages)
+            
+            # Add current user message
+            dict_messages.append({"role": "user", "content": message})
+            
+            # Get AI response
+            response = self.llm.chat(dict_messages)
 
             # Save AI response
             memory.chat_memory.add_ai_message(response)
@@ -197,3 +203,18 @@ class ChatService:
             }
         except Exception as e:
             raise Exception(f"Chat processing failed: {str(e)}")
+
+    def _convert_messages_to_dict(self, messages: List[BaseMessage]) -> List[Dict[str, str]]:
+        """Convert BaseMessage objects to dict format for Venice API"""
+        dict_messages = []
+        for msg in messages:
+            if hasattr(msg, 'content'):
+                if hasattr(msg, 'type') and msg.type == 'human':
+                    dict_messages.append({"role": "user", "content": msg.content})
+                elif hasattr(msg, 'type') and msg.type == 'ai':
+                    dict_messages.append({"role": "assistant", "content": msg.content})
+                else:
+                    dict_messages.append({"role": "user", "content": str(msg.content)})
+            else:
+                dict_messages.append({"role": "user", "content": str(msg)})
+        return dict_messages
