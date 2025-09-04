@@ -145,11 +145,11 @@ class ChatService:
             raise Exception(f"Failed to initialize Venice LLM: {str(e)}")
 
     def process_chat(
-        self, message: str, session_id: Optional[str] = None
+        self, message: str, session_id: Optional[str] = None, user_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         1. RedisChatMessageHistory → store history per session (original)
-        2. ConversationSummaryBufferMemory → auto summarize + keep recent window
+        2. ConversationSummaryBufferMemory → auto summarize + keep k recent messages
         3. LLM Venice → call with context managed by memory
         """
         # Validate input
@@ -162,7 +162,7 @@ class ChatService:
 
         try:
             # Decide TTL: if REDIS_TTL <= 0, do not set TTL (persist forever)
-            ttl_arg: Optional[int] = REDIS_TTL if REDIS_TTL and REDIS_TTL > 0 else None
+            ttl_arg = REDIS_TTL if REDIS_TTL > 0 else None
 
             # RedisChatMessageHistory → store raw messages (not lost when restart app)
             history = RedisChatMessageHistory(
@@ -171,11 +171,11 @@ class ChatService:
 
             # ConversationSummaryBufferMemory → automatically decide: keep k recent messages + old summary
             memory = ConversationSummaryBufferMemory(
-                llm=self.llm,  # Use Venice LLM for summarization
-                chat_memory=history,
-                max_token_limit=MAX_TOKEN_LIMIT,  # Auto-summarize when exceed this limit
-                return_messages=True,
-                k=MEMORY_K,  # Keep k recent messages, older ones get summarized
+                llm= self.llm,  # Use Venice LLM for summarization
+                chat_memory= history,
+                max_token_limit= MAX_TOKEN_LIMIT,  # Auto-summarize when exceed this limit
+                return_messages= False,
+                k= MEMORY_K,  # Keep k recent messages, older ones get summarized
             )
 
             # Add user message to memory
@@ -184,11 +184,26 @@ class ChatService:
             # Get context managed by memory
             past_messages = memory.chat_memory.messages
 
+            top_k_key =f"top_k:{session_id}"
+            top_k_message = past_messages[-MEMORY_K:] if len(past_messages) > MEMORY_K else past_messages
+
+            top_k_data = []
+
+            for msg in top_k_message:
+                if hasattr(msg, 'content'):
+                    if hasattr(msg, 'type') and msg.type == 'human':
+                        top_k_data.append({"role": "user", "content": msg.content, "user_id": getattr(msg, 'user_id', None)})
+                    elif hasattr(msg, 'type') and msg.type == 'ai':
+                        top_k_data.append({"role": "assistant", "content": msg.content, "user_id": getattr(msg, 'user_id', None)})
+                    else:
+                        top_k_data.append({"role": "user", "content": str(msg.content), "user_id": getattr(msg, 'user_id', None)})
+                else:
+                    top_k_data.append({"role": "user", "content": str(msg), "user_id": getattr(msg, 'user_id', None)})
             # Convert BaseMessage objects to dict format for Venice API
             dict_messages = self._convert_messages_to_dict(past_messages)
             
             # Add current user message
-            dict_messages.append({"role": "user", "content": message})
+            dict_messages.append({"role": "user", "content": message, "user_id": user_id})
             
             # Get AI response
             response = self.llm.chat(dict_messages)
@@ -196,10 +211,17 @@ class ChatService:
             # Save AI response
             memory.chat_memory.add_ai_message(response)
 
+            # get summary and top k message form redis
+            stored_summary = history.redis_client.get(f"summary:{session_id}")
+            stored_top_k = history.redis_client.get(top_k_key)
+
+            current_summary = stored_summary.decode('utf-8') if stored_summary else getattr(memory, "moving_summary_buffer", None)
+            current_top_K = stored_top_k.decode('utf-8') if stored_top_k else top_k_data
             return {
                 "session_id": session_id,
                 "answer": response,
-                "summary": getattr(memory, "moving_summary_buffer", None),
+                "summary": current_summary,
+                "top_k": current_top_K,
             }
         except Exception as e:
             raise Exception(f"Chat processing failed: {str(e)}")
@@ -210,11 +232,11 @@ class ChatService:
         for msg in messages:
             if hasattr(msg, 'content'):
                 if hasattr(msg, 'type') and msg.type == 'human':
-                    dict_messages.append({"role": "user", "content": msg.content})
+                    dict_messages.append({"role": "user", "content": msg.content, "user_id": msg.user_id})
                 elif hasattr(msg, 'type') and msg.type == 'ai':
-                    dict_messages.append({"role": "assistant", "content": msg.content})
+                    dict_messages.append({"role": "assistant", "content": msg.content, "user_id": msg.user_id})
                 else:
-                    dict_messages.append({"role": "user", "content": str(msg.content)})
+                    dict_messages.append({"role": "user", "content": str(msg.content), "user_id": msg.user_id})
             else:
-                dict_messages.append({"role": "user", "content": str(msg)})
+                dict_messages.append({"role": "user", "content": str(msg), "user_id": msg.user_id})
         return dict_messages
